@@ -1,0 +1,90 @@
+name: Sync a public repo to my private repo
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+
+env:
+  REMOTE_OWNER: publicOwner
+  REMOTE_REPO: publicRepo
+  LOCAL_BRANCH_PREFIX: sync
+  LOCAL_DEFAULT_BRANCH: master
+  TEAM_REVIEWERS: "myTeam1,myTeam2" # Comma sparated list for adding (team) reviewers
+  # REVIEWERS: "" # Comma sparated list for adding user reviewers
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          path: .local
+          fetch-depth: '0'
+          token: ${{ secrets.PAT }}
+
+      - uses: actions/checkout@v2
+        with:
+          repository: ${{ env.REMOTE_OWNER }}/${{ env.REMOTE_REPO }}
+          path: .remote
+          fetch-depth: '0'
+          token: ${{ secrets.PAT }}
+
+      - name: Setup git
+        run: |
+          git config --global user.name "bot"
+          git config --global user.email "bot@example.com"
+
+      - name: Export ${{ env.REMOTE_OWNER }}/${{ env.REMOTE_REPO }}
+        id: exportstep
+        working-directory: .remote
+        run: |
+          git fetch --depth=1 origin +refs/tags/*:refs/tags/*
+          latestRelease=$(git describe --tags `git rev-list --tags --max-count=1`) # get latest
+          latestReleaseSHA=$(git rev-list -n 1 $latestRelease)
+          echo ::set-output name=release::$latestRelease
+          echo ::set-output name=releaseSHA::$latestReleaseSHA
+
+      - name: Commit and push changes
+        id: commit
+        working-directory: .local
+        run: |
+          git fetch --all
+          RELEASE=${{ steps.exportstep.outputs.release }}
+          RELEASESHA=${{ steps.exportstep.outputs.releaseSHA }}
+          LOCALRELEASE=$(git describe --tags `git rev-list --tags --max-count=1`)
+          git remote add public https://github.com/${{ env.REMOTE_OWNER }}/${{ env.REMOTE_REPO }}.git
+          git fetch --all
+
+          # If branch does not already exist
+          if [[ $(git ls-remote --heads origin "${LOCAL_BRANCH_PREFIX}/${RELEASE}" | wc -l ) == "0" ]]; then
+            git checkout -b ${LOCAL_BRANCH_PREFIX}/${RELEASE} origin/${LOCAL_DEFAULT_BRANCH}
+            git pull public ${RELEASESHA} --allow-unrelated-histories
+            git push -u origin ${LOCAL_BRANCH_PREFIX}/${RELEASE}
+            echo ::set-output name=newrelease::true
+          else
+            echo "Release ${RELEASE} already exist in ${GITHUB_REPOSITORY}"
+          fi
+
+      - name: Create Pull request
+        if: steps.commit.outputs.newrelease == 'true'
+        working-directory: .local
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          RELEASE=${{ steps.exportstep.outputs.release }}
+          RELEASESHA=${{ steps.exportstep.outputs.releaseSHA }}
+
+          cat <<EOF > message.md
+            [RepoSync] Automated sync with $REMOTE_OWNER/$REMOTE_REPO:$RELEASE
+
+            $REMOTE_OWNER/$REMOTE_REPO:
+            - Release tag: $RELEASE
+            - SHA commit: $RELEASESHA
+
+            _In case of conflicts:_
+            - Checkout branch locally `git checkout ${LOCAL_BRANCH_PREFIX}/${RELEASE}`
+            - Resolve conflicts
+            - Push
+          EOF
+
+          hub pull-request --base "${LOCAL_DEFAULT_BRANCH}" --head ${LOCAL_BRANCH_PREFIX}/${RELEASE} -F message.md -r "${TEAM_REVIEWERS}"
